@@ -1,0 +1,4 @@
+interface:
+  display_name: "MCP 路由决策"
+  short_description: "区分知识库、网页和本地文件工具的使用边界"
+  default_prompt: "使用 $mcp-routing 判断应该调用 LightRAG、网页搜索还是本地文件系统工具。"

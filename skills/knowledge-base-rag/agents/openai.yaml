@@ -1,0 +1,4 @@
+interface:
+  display_name: "知识库检索问答"
+  short_description: "先判断是否检索，再基于本地知识回答"
+  default_prompt: "使用 $knowledge-base-rag 判断是否需要查询本地知识库后再回答。"

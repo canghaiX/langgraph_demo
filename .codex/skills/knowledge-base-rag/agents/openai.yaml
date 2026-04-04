@@ -1,0 +1,4 @@
+interface:
+  display_name: "Knowledge Base RAG"
+  short_description: "Retrieve and answer from local knowledge bases"
+  default_prompt: "Use -base-rag to decide whether to query a local knowledge base before answering."

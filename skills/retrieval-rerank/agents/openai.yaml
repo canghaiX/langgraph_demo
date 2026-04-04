@@ -1,0 +1,4 @@
+interface:
+  display_name: "检索后重排"
+  short_description: "对召回片段重排，提升最终回答精度"
+  default_prompt: "使用 $retrieval-rerank 判断何时以及如何在回答前对召回片段重排。"

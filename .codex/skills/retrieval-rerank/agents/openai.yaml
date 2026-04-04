@@ -1,0 +1,4 @@
+interface:
+  display_name: "Retrieval Rerank"
+  short_description: "Rerank retrieved passages for higher answer precision"
+  default_prompt: "Use -rerank to decide when and how to rerank retrieved passages before answering."

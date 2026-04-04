@@ -1,0 +1,35 @@
+[project]
+name = "langgraph-demo"
+version = "0.1.0"
+description = "LangGraph project integrated with LightRAG"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "beautifulsoup4>=4.12.0",
+    "httpx>=0.27.0",
+    "langchain>=1.0.0",
+    "langchain-mcp-adapters>=0.1.0",
+    "langgraph>=1.0.1",
+    "langchain-openai>=0.3.0",
+    "lightrag-hku>=1.4.0",
+    "mcp[cli]>=1.0.0",
+    "Pillow>=10.0.0",
+    "pymupdf>=1.24.0",
+    "pypdf>=5.0.0",
+    "python-dotenv>=1.0.1",
+    "rapidocr-onnxruntime>=1.3.24",
+    "sentence-transformers>=3.0.0",
+]
+
+[project.scripts]
+rag-chat = "langgraph_lightrag_demo.cli:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
