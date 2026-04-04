@@ -3,11 +3,21 @@ from __future__ import annotations
 import argparse
 import asyncio
 from pathlib import Path
+import time
 
 from langchain_core.messages import HumanMessage
 from langchain_core.messages.tool import ToolMessage
 
-from .graph import clear_trace_session, get_agent, get_trace_events, start_trace_session
+from .graph import (
+    clear_metrics_session,
+    clear_trace_session,
+    get_agent,
+    get_metrics_snapshot,
+    get_trace_events,
+    record_request_metric,
+    start_metrics_session,
+    start_trace_session,
+)
 from .lightrag_client import lightrag_service
 
 
@@ -85,6 +95,48 @@ def _print_trace(result: dict, trace_events: list[dict] | None = None) -> None:
             print(f"- result: {name}\n{preview}")
 
 
+def _format_average(values: list[float]) -> str:
+    """格式化一组耗时数据的平均值。"""
+    if not values:
+        return "0.000"
+    return f"{sum(values) / len(values):.3f}"
+
+
+def _print_metrics(metrics: dict) -> None:
+    """打印一次请求级性能指标摘要。"""
+    if not metrics:
+        print("[metrics] 当前没有采集到指标。")
+        return
+
+    request_latencies = metrics.get("request_latency_ms", [])
+    print("[metrics] 性能指标摘要:")
+    print(f"- request_count: {metrics.get('request_count', 0)}")
+    print(f"- avg_request_latency_ms: {_format_average(request_latencies)}")
+    print(f"- router_dispatch_count: {metrics.get('router_dispatch_count', 0)}")
+    print(f"- specialist_call_count: {metrics.get('specialist_call_count', 0)}")
+    print(f"- specialist_error_count: {metrics.get('specialist_error_count', 0)}")
+    print(f"- tool_call_count: {metrics.get('tool_call_count', 0)}")
+    print(f"- tool_error_count: {metrics.get('tool_error_count', 0)}")
+
+    dispatches = metrics.get("router_dispatch_by_specialist", {})
+    if dispatches:
+        print("- router_dispatch_by_specialist:")
+        for name, count in sorted(dispatches.items()):
+            print(f"  - {name}: {count}")
+
+    specialist_latencies = metrics.get("specialist_latency_ms", {})
+    if specialist_latencies:
+        print("- specialist_latency_ms:")
+        for name, elapsed in sorted(specialist_latencies.items()):
+            print(f"  - {name}: {elapsed:.3f}")
+
+    tool_latencies = metrics.get("tool_latency_ms", {})
+    if tool_latencies:
+        print("- tool_latency_ms:")
+        for name, elapsed in sorted(tool_latencies.items()):
+            print(f"  - {name}: {elapsed:.3f}")
+
+
 async def _run_ingest(path_str: str) -> None:
     """执行知识库导入。"""
     target = Path(path_str)
@@ -103,22 +155,30 @@ async def _run_ingest(path_str: str) -> None:
         print(f"- {item}")
 
 
-async def _run_ask(question: str, trace: bool = False) -> None:
+async def _run_ask(question: str, trace: bool = False, metrics: bool = False) -> None:
     """执行单轮问答。
 
     适合做快速测试，也适合配合 `--trace` 看 agent 的工具选择。
     """
     agent = await get_agent()
+    if metrics:
+        start_metrics_session()
     if trace:
         start_trace_session()
+    started_at = time.perf_counter()
     result = await agent.ainvoke({"messages": [HumanMessage(content=question)]})
+    if metrics:
+        record_request_metric((time.perf_counter() - started_at) * 1000)
     if trace:
         _print_trace(result, get_trace_events())
         clear_trace_session()
     print(result["messages"][-1].content)
+    if metrics:
+        _print_metrics(get_metrics_snapshot())
+        clear_metrics_session()
 
 
-async def _run_chat(trace: bool = False) -> None:
+async def _run_chat(trace: bool = False, metrics: bool = False) -> None:
     """执行多轮对话。"""
     agent = await get_agent()
     history = []
@@ -131,15 +191,23 @@ async def _run_chat(trace: bool = False) -> None:
             continue
 
         history.append(HumanMessage(content=user_input))
+        if metrics:
+            start_metrics_session()
         if trace:
             start_trace_session()
+        started_at = time.perf_counter()
         result = await agent.ainvoke({"messages": history})
+        if metrics:
+            record_request_metric((time.perf_counter() - started_at) * 1000)
         reply = result["messages"][-1]
         history.append(reply)
         if trace:
             _print_trace(result, get_trace_events())
             clear_trace_session()
         print(f"\nAI> {reply.content}")
+        if metrics:
+            _print_metrics(get_metrics_snapshot())
+            clear_metrics_session()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -161,12 +229,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print tool-call trace for debugging",
     )
+    ask_parser.add_argument(
+        "--metrics",
+        action="store_true",
+        help="Print request latency and tool/specialist metrics",
+    )
 
     chat_parser = subparsers.add_parser("chat", help="Start interactive chat")
     chat_parser.add_argument(
         "--trace",
         action="store_true",
         help="Print multi-agent trace for each turn",
+    )
+    chat_parser.add_argument(
+        "--metrics",
+        action="store_true",
+        help="Print request latency and tool/specialist metrics for each turn",
     )
     return parser
 
@@ -180,9 +258,20 @@ def main() -> None:
         if args.command == "ingest":
             asyncio.run(_run_ingest(args.path))
         elif args.command == "ask":
-            asyncio.run(_run_ask(args.question, trace=args.trace))
+            asyncio.run(
+                _run_ask(
+                    args.question,
+                    trace=args.trace,
+                    metrics=getattr(args, "metrics", False),
+                )
+            )
         elif args.command == "chat":
-            asyncio.run(_run_chat(trace=getattr(args, "trace", False)))
+            asyncio.run(
+                _run_chat(
+                    trace=getattr(args, "trace", False),
+                    metrics=getattr(args, "metrics", False),
+                )
+            )
         else:
             parser.print_help()
     finally:

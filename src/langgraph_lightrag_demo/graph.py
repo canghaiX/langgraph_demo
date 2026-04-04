@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from contextvars import ContextVar
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
+import time
 import sys
 
 from langchain.agents import create_agent
@@ -115,6 +117,79 @@ _trace_events_var: ContextVar[list[dict[str, str]] | None] = ContextVar(
     "graph_trace_events",
     default=None,
 )
+_metrics_var: ContextVar[dict[str, Any] | None] = ContextVar(
+    "graph_metrics",
+    default=None,
+)
+
+
+def _new_metrics_state() -> dict[str, Any]:
+    """创建一次请求级性能指标容器。"""
+    return {
+        "request_count": 0,
+        "request_latency_ms": [],
+        "router_dispatch_count": 0,
+        "router_dispatch_by_specialist": {},
+        "specialist_call_count": 0,
+        "specialist_error_count": 0,
+        "specialist_latency_ms": {},
+        "tool_call_count": 0,
+        "tool_error_count": 0,
+        "tool_latency_ms": {},
+    }
+
+
+def start_metrics_session() -> None:
+    """开始一次新的性能指标采集会话。"""
+    _metrics_var.set(_new_metrics_state())
+
+
+def get_metrics_snapshot() -> dict[str, Any]:
+    """获取当前性能指标快照。"""
+    state = _metrics_var.get()
+    if state is None:
+        return {}
+    return deepcopy(state)
+
+
+def clear_metrics_session() -> None:
+    """清空当前性能指标采集会话。"""
+    _metrics_var.set(None)
+
+
+def _increment_metric(name: str, amount: int = 1) -> None:
+    """递增整型计数指标。"""
+    state = _metrics_var.get()
+    if state is None:
+        return
+    state[name] = int(state.get(name, 0)) + amount
+
+
+def _increment_named_metric(bucket: str, name: str, amount: int = 1) -> None:
+    """递增按名称分组的计数指标。"""
+    state = _metrics_var.get()
+    if state is None:
+        return
+    values = state.setdefault(bucket, {})
+    values[name] = int(values.get(name, 0)) + amount
+
+
+def _record_duration_metric(bucket: str, name: str, elapsed_ms: float) -> None:
+    """记录按名称分组的耗时指标。"""
+    state = _metrics_var.get()
+    if state is None:
+        return
+    durations = state.setdefault(bucket, {})
+    durations[name] = round(float(durations.get(name, 0.0)) + elapsed_ms, 3)
+
+
+def record_request_metric(elapsed_ms: float) -> None:
+    """记录一次请求的总耗时。"""
+    state = _metrics_var.get()
+    if state is None:
+        return
+    state["request_count"] = int(state.get("request_count", 0)) + 1
+    state.setdefault("request_latency_ms", []).append(round(float(elapsed_ms), 3))
 
 
 def _build_source_citation_rules() -> str:
@@ -369,6 +444,8 @@ async def _ask_specialist(agent_name: str, agent, question: str) -> str:
         agent_name,
         f"question={_preview_trace_text(question)}",
     )
+    _increment_metric("specialist_call_count")
+    started_at = time.perf_counter()
     try:
         result = await agent.ainvoke({"messages": [HumanMessage(content=question)]})
         reply = _agent_result_to_text(result)
@@ -377,9 +454,20 @@ async def _ask_specialist(agent_name: str, agent, question: str) -> str:
             agent_name,
             _preview_trace_text(reply),
         )
+        _record_duration_metric(
+            "specialist_latency_ms",
+            agent_name,
+            (time.perf_counter() - started_at) * 1000,
+        )
         return reply
     except Exception as exc:
         message = f"{agent_name} failed: {exc}"
+        _increment_metric("specialist_error_count")
+        _record_duration_metric(
+            "specialist_latency_ms",
+            agent_name,
+            (time.perf_counter() - started_at) * 1000,
+        )
         _append_trace_event("specialist_error", agent_name, message)
         return message
 
@@ -396,13 +484,25 @@ async def search_knowledge_base(question: str) -> str:
         "search_knowledge_base",
         f"question={_preview_trace_text(question)}",
     )
-    context = await lightrag_service.query_context(question)
-    _append_trace_event(
-        "tool_result",
-        "search_knowledge_base",
-        f"context_chars={len(context)} preview={_preview_trace_text(context)}",
-    )
-    return context
+    _increment_metric("tool_call_count")
+    started_at = time.perf_counter()
+    try:
+        context = await lightrag_service.query_context(question)
+        _append_trace_event(
+            "tool_result",
+            "search_knowledge_base",
+            f"context_chars={len(context)} preview={_preview_trace_text(context)}",
+        )
+        return context
+    except Exception:
+        _increment_metric("tool_error_count")
+        raise
+    finally:
+        _record_duration_metric(
+            "tool_latency_ms",
+            "search_knowledge_base",
+            (time.perf_counter() - started_at) * 1000,
+        )
 
 
 @tool
@@ -420,27 +520,39 @@ async def rerank_retrieved_context(question: str, retrieved_context: str) -> str
             f"retrieved_context_chars={len(retrieved_context)}"
         ),
     )
-    passages = reranker_service.split_passages(retrieved_context)
-    ranked = await reranker_service.arerank(question, passages)
-    if not ranked:
+    _increment_metric("tool_call_count")
+    started_at = time.perf_counter()
+    try:
+        passages = reranker_service.split_passages(retrieved_context)
+        ranked = await reranker_service.arerank(question, passages)
+        if not ranked:
+            _append_trace_event(
+                "tool_result",
+                "rerank_retrieved_context",
+                "no_passages_after_rerank",
+            )
+            return "No passages were available to rerank."
+
+        lines = [
+            f"[{index}] score={item.score:.4f}\n{item.text}"
+            for index, item in enumerate(ranked, start=1)
+        ]
+        result = "\n\n".join(lines)
         _append_trace_event(
             "tool_result",
             "rerank_retrieved_context",
-            "no_passages_after_rerank",
+            f"ranked_passages={len(ranked)} preview={_preview_trace_text(result)}",
         )
-        return "No passages were available to rerank."
-
-    lines = [
-        f"[{index}] score={item.score:.4f}\n{item.text}"
-        for index, item in enumerate(ranked, start=1)
-    ]
-    result = "\n\n".join(lines)
-    _append_trace_event(
-        "tool_result",
-        "rerank_retrieved_context",
-        f"ranked_passages={len(ranked)} preview={_preview_trace_text(result)}",
-    )
-    return result
+        return result
+    except Exception:
+        _increment_metric("tool_error_count")
+        raise
+    finally:
+        _record_duration_metric(
+            "tool_latency_ms",
+            "rerank_retrieved_context",
+            (time.perf_counter() - started_at) * 1000,
+        )
 
 
 @tool
@@ -454,6 +566,10 @@ async def consult_knowledge_specialist(question: str) -> str:
         "router_dispatch",
         "Router Agent",
         "dispatch_to=knowledge_specialist",
+    )
+    _increment_metric("router_dispatch_count")
+    _increment_named_metric(
+        "router_dispatch_by_specialist", "knowledge_specialist"
     )
     agent = await _get_knowledge_agent()
     return await _ask_specialist("knowledge_specialist", agent, question)
@@ -474,6 +590,10 @@ async def consult_filesystem_specialist(question: str) -> str:
         "Router Agent",
         "dispatch_to=filesystem_specialist",
     )
+    _increment_metric("router_dispatch_count")
+    _increment_named_metric(
+        "router_dispatch_by_specialist", "filesystem_specialist"
+    )
     agent = await _get_file_agent()
     return await _ask_specialist("filesystem_specialist", agent, question)
 
@@ -491,6 +611,8 @@ async def consult_web_specialist(question: str) -> str:
         "Router Agent",
         "dispatch_to=web_specialist",
     )
+    _increment_metric("router_dispatch_count")
+    _increment_named_metric("router_dispatch_by_specialist", "web_specialist")
     agent = await _get_web_agent()
     return await _ask_specialist("web_specialist", agent, question)
 

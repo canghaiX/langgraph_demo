@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from langgraph_lightrag_demo.cli import SUPPORTED_SUFFIXES, _collect_files
+from langgraph_lightrag_demo.cli import SUPPORTED_SUFFIXES, _collect_files, build_parser
 
 
 def test_supported_suffixes_include_pdf() -> None:
@@ -26,3 +26,13 @@ def test_collect_files_filters_supported_suffixes(tmp_path: Path) -> None:
     collected = _collect_files(tmp_path)
 
     assert collected == sorted([keep_md, keep_txt, keep_pdf])
+
+
+def test_build_parser_supports_metrics_flags() -> None:
+    parser = build_parser()
+
+    ask_args = parser.parse_args(["ask", "hello", "--metrics"])
+    chat_args = parser.parse_args(["chat", "--metrics"])
+
+    assert ask_args.metrics is True
+    assert chat_args.metrics is True
