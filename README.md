@@ -8,6 +8,7 @@
 
 - 多 Agent 架构：将系统拆分为 `Router / Knowledge Specialist / Filesystem Specialist / Web Specialist`
 - RAG 检索链路：集成 LightRAG 做知识库召回，并支持 CrossEncoder rerank
+- 语义递归切分：入库前按标题、段落、句子做递归 chunk 切分，尽量保留语义边界
 - 非结构化文档处理：支持 `.txt / .md / .pdf` 入库，PDF 优先直抽文本，失败时自动回退 OCR
 - 可观测性：支持 trace 输出，方便查看 Router 分发、专家调用和底层工具调用轨迹
 - MCP 工具集成：通过本地 MCP Server 接入文件系统检索与网页搜索能力
@@ -80,7 +81,13 @@ Router Agent
 - 对 LightRAG 已召回上下文做二次排序，提升相关片段靠前概率
 - reranker 采用懒加载，避免程序启动即加载本地大模型
 
-### 3. PDF 入库与 OCR 回退
+### 3. 语义递归切分
+
+- 入库前先按标题、页码标记、段落、句子、分句做一轮递归语义切分
+- 尽量保留章节结构与页码信息，避免简单定长切分破坏上下文
+- 为每个 chunk 注入来源文件和 section path，便于召回溯源与答案引用
+
+### 4. PDF 入库与 OCR 回退
 
 - 对电子版 PDF，优先用 `pypdf` 直接抽取文本
 - 如果抽取得到的正文过少，自动回退到 `PyMuPDF + RapidOCR`
@@ -91,7 +98,7 @@ Router Agent
   - 跨页重复页眉页脚清理
   - 页码标记插入，便于后续溯源
 
-### 4. 来源标注与 trace
+### 5. 来源标注与 trace
 
 - Prompt 中统一要求基于工具证据回答，并尽量标注来源
 - 支持在 CLI 中通过 `--trace` 查看跨层级调用轨迹

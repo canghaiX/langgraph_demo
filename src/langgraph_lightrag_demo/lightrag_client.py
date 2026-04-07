@@ -12,6 +12,7 @@ from lightrag.llm.openai import openai_complete_if_cache, openai_embed
 from lightrag.utils import setup_logger, wrap_embedding_func_with_attrs
 
 from .config import settings
+from .semantic_chunker import SemanticChunk, chunk_text_by_semantics
 
 
 # 打开 LightRAG 自身日志，方便你观察建库和查询过程。
@@ -487,6 +488,30 @@ def _extract_text_from_path(path: Path) -> str:
     raise ValueError(f"Unsupported file type for ingestion: {path.suffix}")
 
 
+def _format_semantic_chunk_for_ingest(
+    path: Path,
+    chunk: SemanticChunk,
+) -> str:
+    """把语义 chunk 渲染成带来源元数据的入库文本。"""
+    parts = ["[Source File]", path.name]
+    if chunk.section_path:
+        section_path = " > ".join(part for part in chunk.section_path if part)
+        if section_path:
+            parts.extend(["", "[Section Path]", section_path])
+    if chunk.page_marker:
+        parts.extend(["", chunk.page_marker])
+    parts.extend(["", chunk.text.strip()])
+    return "\n".join(part for part in parts if part is not None).strip()
+
+
+def _build_ingest_documents(path: Path, content: str) -> list[str]:
+    """把单个文件内容切成语义 chunk，并渲染成入库文档。"""
+    chunks = chunk_text_by_semantics(content, max_tokens=settings.chunk_token_size)
+    if not chunks:
+        return []
+    return [_format_semantic_chunk_for_ingest(path, chunk) for chunk in chunks]
+
+
 class LightRAGService:
     """负责管理项目里唯一的一份 LightRAG 实例。
 
@@ -530,10 +555,12 @@ class LightRAGService:
 
         注意职责边界：
         - 文件解析、PDF 直抽、OCR 回退：在这里完成
-        - 文本切块、实体/关系抽取、索引构建：交给 LightRAG 内部完成
+        - 语义递归切分：在入库前先完成一轮预切分
+        - 实体/关系抽取、索引构建：交给 LightRAG 内部完成
 
         这样拆分的好处是：
         - 业务层可以自由扩展更多文件格式
+        - 入库前先尽量保留章节、段落、句子这些语义边界
         - LightRAG 始终只接收它最擅长处理的“纯文本”
         """
         rag = await self.get_rag()
@@ -545,10 +572,12 @@ class LightRAGService:
                     f"No readable text could be extracted from file: {path}"
                 )
 
-            # 额外附带来源文件名，能让后续召回结果更容易追溯到源文件。
-            # 对于多文档知识库，这通常比只存裸文本更利于排查答案出处。
-            content = f"[Source File]\n{path.name}\n\n{content}"
-            await rag.ainsert(content)
+            documents = _build_ingest_documents(path, content)
+            if not documents:
+                raise ValueError(f"No semantic chunks were produced for file: {path}")
+
+            for document in documents:
+                await rag.ainsert(document)
             inserted.append(path)
         return inserted
 
