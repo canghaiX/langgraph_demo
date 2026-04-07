@@ -78,3 +78,44 @@ def test_build_ingest_documents_adds_source_and_section_metadata() -> None:
     assert "[Source File]\ndemo.md" in documents[0]
     assert "[Section Path]\n项目介绍" in documents[0]
     assert "[PDF Page 3]" in documents[0]
+
+
+def test_section_aware_merge_does_not_cross_sections() -> None:
+    text = """
+    # 第一章
+
+    很短。
+
+    # 第二章
+
+    也很短。
+    """.strip()
+
+    chunks = chunk_text_by_semantics(
+        text,
+        max_tokens=80,
+        min_chunk_tokens=20,
+        overlap_sentences=0,
+    )
+
+    assert len(chunks) == 2
+    assert chunks[0].section_path == ("第一章",)
+    assert chunks[1].section_path == ("第二章",)
+
+
+def test_chunk_overlap_reuses_previous_sentence_context() -> None:
+    text = """
+    # 项目说明
+
+    第一句提供背景信息。第二句继续解释设计。第三句说明实现细节。第四句给出额外补充。
+    """.strip()
+
+    chunks = chunk_text_by_semantics(
+        text,
+        max_tokens=28,
+        min_chunk_tokens=1,
+        overlap_sentences=1,
+    )
+
+    assert len(chunks) >= 2
+    assert "第二句继续解释设计。" in chunks[1].text or "第三句说明实现细节。" in chunks[1].text

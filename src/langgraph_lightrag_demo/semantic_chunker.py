@@ -62,6 +62,7 @@ def chunk_text_by_semantics(
     text: str,
     max_tokens: int,
     min_chunk_tokens: int | None = None,
+    overlap_sentences: int = 0,
 ) -> list[SemanticChunk]:
     """按语义单元递归切分文本。
 
@@ -89,7 +90,12 @@ def chunk_text_by_semantics(
             )
         )
 
-    return _merge_small_chunks(chunks, max_tokens=max_tokens, min_tokens=lower_bound)
+    merged = _merge_small_chunks(chunks, max_tokens=max_tokens, min_tokens=lower_bound)
+    return _apply_chunk_overlap(
+        merged,
+        max_tokens=max_tokens,
+        overlap_sentences=overlap_sentences,
+    )
 
 
 def _split_into_structural_blocks(text: str) -> list[_SemanticBlock]:
@@ -287,7 +293,7 @@ def _merge_small_chunks(
     max_tokens: int,
     min_tokens: int,
 ) -> list[SemanticChunk]:
-    """把同一语义上下文中过短的相邻块尽量回并。"""
+    """把同一 section/page 上下文中过短的相邻块尽量回并。"""
     if not chunks:
         return []
 
@@ -298,10 +304,7 @@ def _merge_small_chunks(
             continue
 
         previous = merged[-1]
-        same_context = (
-            previous.section_path == chunk.section_path
-            and previous.page_marker == chunk.page_marker
-        )
+        same_context = _can_section_merge(previous, chunk)
         if not same_context:
             merged.append(chunk)
             continue
@@ -324,6 +327,89 @@ def _merge_small_chunks(
         merged.append(chunk)
 
     return merged
+
+
+def _can_section_merge(previous: SemanticChunk, current: SemanticChunk) -> bool:
+    """只允许同一 section/page 内的短块回并，避免跨主题拼接。"""
+    return (
+        previous.section_path == current.section_path
+        and previous.page_marker == current.page_marker
+    )
+
+
+def _apply_chunk_overlap(
+    chunks: list[SemanticChunk],
+    max_tokens: int,
+    overlap_sentences: int,
+) -> list[SemanticChunk]:
+    """为同一 section 内的相邻 chunk 注入少量句子级 overlap。"""
+    if overlap_sentences <= 0 or len(chunks) <= 1:
+        return chunks
+
+    overlapped: list[SemanticChunk] = [chunks[0]]
+    for chunk in chunks[1:]:
+        previous = overlapped[-1]
+        if not _can_section_merge(previous, chunk):
+            overlapped.append(chunk)
+            continue
+
+        overlap_text = _build_overlap_text(previous.text, overlap_sentences)
+        if not overlap_text or chunk.text.startswith(overlap_text):
+            overlapped.append(chunk)
+            continue
+
+        candidate = SemanticChunk(
+            text=f"{overlap_text}\n\n{chunk.text}".strip(),
+            section_path=chunk.section_path,
+            page_marker=chunk.page_marker,
+        )
+        if estimate_token_count(_render_chunk_text(candidate)) <= max_tokens:
+            overlapped.append(candidate)
+            continue
+
+        fitted_overlap = _fit_overlap_within_budget(
+            previous.text,
+            chunk,
+            max_tokens=max_tokens,
+            overlap_sentences=overlap_sentences,
+        )
+        overlapped.append(fitted_overlap or chunk)
+
+    return overlapped
+
+
+def _build_overlap_text(text: str, overlap_sentences: int) -> str:
+    """从上一个 chunk 末尾提取若干句，作为下一个 chunk 的重叠上下文。"""
+    sentences = _extract_units_with_pattern(text, _SENTENCE_PATTERN)
+    if not sentences:
+        return ""
+    tail = sentences[-overlap_sentences:]
+    return "".join(tail).strip()
+
+
+def _fit_overlap_within_budget(
+    previous_text: str,
+    chunk: SemanticChunk,
+    max_tokens: int,
+    overlap_sentences: int,
+) -> SemanticChunk | None:
+    """在 token 预算内尽量保留 overlap。"""
+    sentences = _extract_units_with_pattern(previous_text, _SENTENCE_PATTERN)
+    if not sentences:
+        return None
+
+    for size in range(min(overlap_sentences, len(sentences)), 0, -1):
+        overlap_text = "".join(sentences[-size:]).strip()
+        if not overlap_text or chunk.text.startswith(overlap_text):
+            continue
+        candidate = SemanticChunk(
+            text=f"{overlap_text}\n\n{chunk.text}".strip(),
+            section_path=chunk.section_path,
+            page_marker=chunk.page_marker,
+        )
+        if estimate_token_count(_render_chunk_text(candidate)) <= max_tokens:
+            return candidate
+    return None
 
 
 def _render_chunk_text(chunk: SemanticChunk, body: str | None = None) -> str:

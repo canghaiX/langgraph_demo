@@ -57,6 +57,12 @@ class Settings:
     chunk_overlap_token_size: int = int(
         os.getenv("CHUNK_OVERLAP_TOKEN_SIZE", "100")
     )
+    semantic_chunk_min_tokens: int = int(
+        os.getenv("SEMANTIC_CHUNK_MIN_TOKENS", "80")
+    )
+    semantic_chunk_overlap_sentences: int = int(
+        os.getenv("SEMANTIC_CHUNK_OVERLAP_SENTENCES", "1")
+    )
 
     # MCP 的开关和运行范围控制。
     enable_mcp_web_search: bool = (

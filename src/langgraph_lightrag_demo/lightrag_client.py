@@ -506,7 +506,12 @@ def _format_semantic_chunk_for_ingest(
 
 def _build_ingest_documents(path: Path, content: str) -> list[str]:
     """把单个文件内容切成语义 chunk，并渲染成入库文档。"""
-    chunks = chunk_text_by_semantics(content, max_tokens=settings.chunk_token_size)
+    chunks = chunk_text_by_semantics(
+        content,
+        max_tokens=settings.chunk_token_size,
+        min_chunk_tokens=settings.semantic_chunk_min_tokens,
+        overlap_sentences=settings.semantic_chunk_overlap_sentences,
+    )
     if not chunks:
         return []
     return [_format_semantic_chunk_for_ingest(path, chunk) for chunk in chunks]
