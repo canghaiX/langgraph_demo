@@ -8,6 +8,7 @@
 
 - 多 Agent 架构：将系统拆分为 `Router / Knowledge Specialist / Filesystem Specialist / Web Specialist`
 - RAG 检索链路：集成 LightRAG 做知识库召回，并支持 CrossEncoder rerank
+- Agentic RAG 增强：支持显式执行计划、证据不足反思重试和多专家结果汇总
 - 语义递归切分：入库前按标题、段落、句子做递归 chunk 切分，尽量保留语义边界
 - 记忆机制：支持用户偏好记忆与会话摘要记忆，提升跨轮对话连续性
 - 非结构化文档处理：支持 `.txt / .md / .pdf` 入库，PDF 优先直抽文本，失败时自动回退 OCR
@@ -31,6 +32,7 @@
 │  ├─ config.py               # 统一配置管理
 │  ├─ graph.py                # 多 Agent 编排与工具路由
 │  ├─ lightrag_client.py      # LightRAG 接入、文档解析与入库
+│  ├─ memory.py               # 用户偏好记忆与会话摘要记忆
 │  ├─ reranker.py             # CrossEncoder 重排
 │  └─ mcp_servers/
 │     ├─ filesystem_server.py # 本地文件 MCP Server
@@ -75,6 +77,12 @@ Router Agent
 - 使用 LightRAG 管理知识库存储与召回
 - 当前实现让 LightRAG 只返回检索上下文，不直接输出最终答案
 - 最终回答由上层 Agent 结合上下文进行组织，便于和其他工具结果汇总
+
+### 1.1 Agentic RAG 编排增强
+
+- Router 在执行前先形成显式计划，判断是否需要工具、优先调用哪个专家、是否需要备选专家
+- 当首个专家返回“证据不足”时，Router 会触发反思式重试，自动切换到后备专家
+- 当问题天然涉及多信息源时，Router 会串联多个专家，再用汇总器统一生成最终答案
 
 ### 2. 检索后重排
 

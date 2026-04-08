@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from contextvars import ContextVar
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 import time
 import sys
 
 from langchain.agents import create_agent
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import ChatOpenAI
@@ -67,6 +68,14 @@ def _build_chat_model() -> ChatOpenAI:
     )
 
 
+def _extract_latest_user_text(messages: list[BaseMessage]) -> str:
+    """提取消息列表中最后一个用户问题。"""
+    for message in reversed(messages):
+        if isinstance(message, HumanMessage):
+            return _message_content_to_text(message.content)
+    return ""
+
+
 def _message_content_to_text(content: Any) -> str:
     """把 LangChain message content 尽量转换为字符串。
 
@@ -101,6 +110,141 @@ def _agent_result_to_text(result: dict) -> str:
     return _message_content_to_text(messages[-1].content)
 
 
+def _question_mentions_web(question: str) -> bool:
+    keywords = (
+        "最新",
+        "官网",
+        "联网",
+        "网页",
+        "搜索",
+        "新闻",
+        "today",
+        "latest",
+        "official",
+        "web",
+    )
+    lowered = question.lower()
+    return any(keyword in lowered for keyword in keywords)
+
+
+def _question_mentions_filesystem(question: str) -> bool:
+    keywords = (
+        "代码",
+        "源码",
+        "文件",
+        "配置",
+        "readme",
+        "项目里",
+        "仓库",
+        ".py",
+        "在哪定义",
+        "哪个文件",
+    )
+    lowered = question.lower()
+    return any(keyword in lowered for keyword in keywords)
+
+
+def _question_needs_knowledge(question: str) -> bool:
+    keywords = (
+        "知识库",
+        "资料",
+        "文档",
+        "总结",
+        "概念",
+        "项目",
+        "rag",
+        "lightrag",
+    )
+    lowered = question.lower()
+    return any(keyword in lowered for keyword in keywords)
+
+
+def _question_is_simple_chat(question: str) -> bool:
+    lowered = question.strip().lower()
+    trivial = (
+        "你好",
+        "hello",
+        "hi",
+        "谢谢",
+        "thank you",
+        "你是谁",
+    )
+    return any(lowered == item or lowered.startswith(item) for item in trivial)
+
+
+def _build_execution_plan(question: str) -> ExecutionPlan:
+    """按问题特征构建显式执行计划。"""
+    if _question_is_simple_chat(question):
+        return ExecutionPlan(
+            needs_tools=False,
+            primary_specialist=None,
+            fallback_specialists=(),
+            requires_aggregation=False,
+            reasoning="问题更像闲聊或无需检索的直接问答，先直接回答。",
+        )
+
+    mentions_web = _question_mentions_web(question)
+    mentions_files = _question_mentions_filesystem(question)
+    needs_knowledge = _question_needs_knowledge(question)
+    asks_compare = any(
+        token in question for token in ("同时", "结合", "综合", "对比", "比较")
+    )
+
+    if mentions_web and mentions_files:
+        return ExecutionPlan(
+            needs_tools=True,
+            primary_specialist="filesystem_specialist",
+            fallback_specialists=("web_specialist", "knowledge_specialist"),
+            requires_aggregation=True,
+            reasoning="问题同时涉及本地项目与最新网页信息，先查工作区，再补网页与知识库证据。",
+        )
+
+    if mentions_web:
+        return ExecutionPlan(
+            needs_tools=True,
+            primary_specialist="web_specialist",
+            fallback_specialists=("knowledge_specialist",),
+            requires_aggregation=asks_compare,
+            reasoning="问题明显依赖公开互联网或最新信息，优先使用 Web Specialist。",
+        )
+
+    if mentions_files:
+        return ExecutionPlan(
+            needs_tools=True,
+            primary_specialist="filesystem_specialist",
+            fallback_specialists=(
+                ("knowledge_specialist", "web_specialist")
+                if asks_compare
+                else ("knowledge_specialist",)
+            ),
+            requires_aggregation=asks_compare,
+            reasoning="问题聚焦当前工作区代码与文档，优先使用 Filesystem Specialist。",
+        )
+
+    if needs_knowledge:
+        return ExecutionPlan(
+            needs_tools=True,
+            primary_specialist="knowledge_specialist",
+            fallback_specialists=("filesystem_specialist", "web_specialist"),
+            requires_aggregation=asks_compare,
+            reasoning="问题更像知识库/项目资料问答，优先使用 Knowledge Specialist，并在证据不足时补其他来源。",
+        )
+
+    return ExecutionPlan(
+        needs_tools=False,
+        primary_specialist=None,
+        fallback_specialists=(),
+        requires_aggregation=False,
+        reasoning="问题没有明显工具依赖，先尝试直接回答。",
+    )
+
+
+def _response_indicates_insufficient_evidence(text: str) -> bool:
+    """判断专家结果是否显示证据不足。"""
+    lowered = text.lower()
+    return any(pattern in lowered for pattern in _INSUFFICIENT_EVIDENCE_PATTERNS)
+
+
 # 下面这些对象都是“懒加载缓存”。
 #
 # 对 multi-agent 系统来说，这样做尤其重要：
@@ -121,6 +265,35 @@ _metrics_var: ContextVar[dict[str, Any] | None] = ContextVar(
     "graph_metrics",
     default=None,
 )
+_SPECIALIST_LABELS = {
+    "knowledge_specialist": "Knowledge Specialist",
+    "filesystem_specialist": "Filesystem Specialist",
+    "web_specialist": "Web Specialist",
+}
+_INSUFFICIENT_EVIDENCE_PATTERNS = (
+    "未找到",
+    "没有足够",
+    "证据不足",
+    "未提供",
+    "无法确认",
+    "未检索到",
+    "未找到相关",
+    "insufficient",
+    "not enough",
+    "not found",
+    "unavailable",
+)
+
+
+@dataclass(frozen=True)
+class ExecutionPlan:
+    """描述一次问题处理的显式执行计划。"""
+
+    needs_tools: bool
+    primary_specialist: str | None
+    fallback_specialists: tuple[str, ...]
+    requires_aggregation: bool
+    reasoning: str
 
 
 def _new_metrics_state() -> dict[str, Any]:
@@ -248,6 +421,13 @@ def _append_trace_event(stage: str, actor: str, detail: str) -> None:
     events.append({"stage": stage, "actor": actor, "detail": detail})
 
 
+async def _direct_answer(messages: list[BaseMessage]) -> str:
+    """直接使用聊天模型回答无需工具的问题。"""
+    _append_trace_event("router_direct_answer", "Router Agent", "plan=direct_answer")
+    result = await _build_chat_model().ainvoke(messages)
+    return _message_content_to_text(result.content)
+
+
 async def _load_web_mcp_tools():
     """只加载网页专家所需的 MCP tools。
 
@@ -332,11 +512,13 @@ def _build_router_system_prompt() -> str:
         "- `consult_web_specialist`：处理公开网页、官网、联网搜索、最新网页内容\n\n"
         "Router 决策规则：\n"
         "1. 如果问题不需要工具，直接回答。\n"
-        "2. 如果问题明显依赖知识库或已入库资料，优先交给知识库专家。\n"
-        "3. 如果问题明显依赖当前工作区文件，优先交给文件专家。\n"
-        "4. 如果问题依赖公开网页或最新互联网信息，优先交给网页专家。\n"
-        "5. 不要为了保险一次性调用所有专家。先选最可能正确的那个；只有证据不足时再考虑第二个专家。\n"
-        "6. 如果综合了多个专家的结果，请明确区分不同来源。\n\n"
+        "2. 先显式形成一个简短执行计划：要不要用工具、先问谁、是否需要备选专家。\n"
+        "3. 如果问题明显依赖知识库或已入库资料，优先交给知识库专家。\n"
+        "4. 如果问题明显依赖当前工作区文件，优先交给文件专家。\n"
+        "5. 如果问题依赖公开网页或最新互联网信息，优先交给网页专家。\n"
+        "6. 不要为了保险一次性调用所有专家。先选最可能正确的那个；只有证据不足时再考虑第二个专家。\n"
+        "7. 如果首个专家证据不足，要反思信息缺口，再决定是否重试或切换专家。\n"
+        "8. 如果综合了多个专家的结果，请明确区分不同来源并给出统一结论。\n\n"
         "请遵循以下项目内路由规则：\n\n"
         f"{_build_skill_guidance_for('knowledge-base-rag', 'mcp-routing')}\n\n"
         f"{_build_source_citation_rules()}"
@@ -615,6 +797,115 @@ async def consult_web_specialist(question: str) -> str:
     _increment_named_metric("router_dispatch_by_specialist", "web_specialist")
     agent = await _get_web_agent()
     return await _ask_specialist("web_specialist", agent, question)
+
+
+async def _invoke_specialist_tool(specialist_name: str, question: str) -> str:
+    """通过专家 tool 调用对应 specialist。"""
+    if specialist_name == "knowledge_specialist":
+        return await consult_knowledge_specialist.ainvoke({"question": question})
+    if specialist_name == "filesystem_specialist":
+        return await consult_filesystem_specialist.ainvoke({"question": question})
+    if specialist_name == "web_specialist":
+        return await consult_web_specialist.ainvoke({"question": question})
+    raise ValueError(f"Unknown specialist: {specialist_name}")
+
+
+async def _aggregate_specialist_results(
+    question: str,
+    results: dict[str, str],
+) -> str:
+    """汇总多专家结果，生成最终回答。"""
+    sections = []
+    for name, content in results.items():
+        label = _SPECIALIST_LABELS.get(name, name)
+        sections.append(f"[{label}]\n{content}")
+
+    prompt = (
+        "你是多专家结果汇总器。请基于不同专家返回的证据生成最终回答。\n"
+        "要求：\n"
+        "1. 优先保留被多个来源共同支持的结论。\n"
+        "2. 如果不同来源结论不一致，要明确指出分歧。\n"
+        "3. 如果某个专家结果明显表示证据不足，不要把它包装成确定事实。\n"
+        "4. 在答案末尾添加“来源”小节，区分不同专家对应的来源线索。"
+    )
+    joined_sections = "\n\n".join(sections)
+    human_content = (
+        f"[用户问题]\n{question}\n\n"
+        f"[专家结果]\n{joined_sections}\n\n"
+        "请输出最终汇总答案："
+    )
+    _append_trace_event(
+        "aggregation",
+        "Router Agent",
+        f"specialists={','.join(results.keys())}",
+    )
+    try:
+        result = await _build_chat_model().ainvoke(
+            [
+                SystemMessage(content=prompt),
+                HumanMessage(content=human_content),
+            ]
+        )
+        return _message_content_to_text(result.content)
+    except Exception:
+        merged = ["综合多个专家结果如下：", *sections]
+        return "\n\n".join(merged)
+
+
+async def answer_with_agentic_rag(messages: list[BaseMessage]) -> str:
+    """显式执行计划、失败反思重试和多专家聚合的主入口。"""
+    question = _extract_latest_user_text(messages)
+    if not question:
+        return await _direct_answer(messages)
+
+    plan = _build_execution_plan(question)
+    _append_trace_event(
+        "router_plan",
+        "Router Agent",
+        (
+            f"needs_tools={plan.needs_tools} "
+            f"primary={plan.primary_specialist or 'none'} "
+            f"fallbacks={','.join(plan.fallback_specialists) or 'none'} "
+            f"aggregate={plan.requires_aggregation} "
+            f"reasoning={plan.reasoning}"
+        ),
+    )
+
+    if not plan.needs_tools or plan.primary_specialist is None:
+        return await _direct_answer(messages)
+
+    specialist_results: dict[str, str] = {}
+    primary_result = await _invoke_specialist_tool(plan.primary_specialist, question)
+    specialist_results[plan.primary_specialist] = primary_result
+
+    should_retry = _response_indicates_insufficient_evidence(primary_result)
+    if should_retry:
+        _append_trace_event(
+            "reflection_retry",
+            "Router Agent",
+            (
+                f"primary={plan.primary_specialist} "
+                f"reason=insufficient_evidence "
+                f"fallbacks={','.join(plan.fallback_specialists) or 'none'}"
+            ),
+        )
+
+    for specialist_name in plan.fallback_specialists:
+        if not should_retry and not plan.requires_aggregation:
+            break
+
+        result = await _invoke_specialist_tool(specialist_name, question)
+        specialist_results[specialist_name] = result
+
+        if should_retry and not _response_indicates_insufficient_evidence(result):
+            should_retry = False
+            if not plan.requires_aggregation:
+                break
+
+    if len(specialist_results) == 1 and not plan.requires_aggregation:
+        return next(iter(specialist_results.values()))
+
+    return await _aggregate_specialist_results(question, specialist_results)
 
 
 async def get_agent():

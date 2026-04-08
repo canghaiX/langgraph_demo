@@ -5,14 +5,14 @@ import asyncio
 from pathlib import Path
 import time
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.messages.tool import ToolMessage
 
 from .config import settings
 from .graph import (
+    answer_with_agentic_rag,
     clear_metrics_session,
     clear_trace_session,
-    get_agent,
     get_metrics_snapshot,
     get_trace_events,
     record_request_metric,
@@ -20,7 +20,7 @@ from .graph import (
     start_trace_session,
 )
 from .lightrag_client import lightrag_service
-from .memory import memory_manager, message_content_to_text
+from .memory import memory_manager
 
 
 # 这里定义“CLI 允许挑出来做入库”的文件类型。
@@ -175,7 +175,6 @@ async def _run_ask(
 
     适合做快速测试，也适合配合 `--trace` 看 agent 的工具选择。
     """
-    agent = await get_agent()
     memory_manager.infer_and_update_preferences(user_id, question)
     if metrics:
         start_metrics_session()
@@ -186,13 +185,12 @@ async def _run_ask(
         user_id,
         [HumanMessage(content=question)],
     )
-    result = await agent.ainvoke({"messages": request_messages})
+    reply_text = await answer_with_agentic_rag(request_messages)
     if metrics:
         record_request_metric((time.perf_counter() - started_at) * 1000)
     if trace:
-        _print_trace(result, get_trace_events())
+        _print_trace({}, get_trace_events())
         clear_trace_session()
-    reply_text = message_content_to_text(result["messages"][-1].content)
     print(reply_text)
     await memory_manager.remember_exchange(user_id, question, reply_text)
     if metrics:
@@ -206,7 +204,6 @@ async def _run_chat(
     user_id: str = settings.default_user_id,
 ) -> None:
     """执行多轮对话。"""
-    agent = await get_agent()
     history = []
     print("Interactive chat started. Type 'exit' or 'quit' to stop.")
     while True:
@@ -224,16 +221,15 @@ async def _run_chat(
             start_trace_session()
         started_at = time.perf_counter()
         request_messages = _build_agent_messages(user_id, history)
-        result = await agent.ainvoke({"messages": request_messages})
+        reply_text = await answer_with_agentic_rag(request_messages)
         if metrics:
             record_request_metric((time.perf_counter() - started_at) * 1000)
-        reply = result["messages"][-1]
-        history.append(reply)
+        history.append(AIMessage(content=reply_text))
         history = await memory_manager.compact_history(user_id, history)
         if trace:
-            _print_trace(result, get_trace_events())
+            _print_trace({}, get_trace_events())
             clear_trace_session()
-        print(f"\nAI> {message_content_to_text(reply.content)}")
+        print(f"\nAI> {reply_text}")
         if metrics:
             _print_metrics(get_metrics_snapshot())
             clear_metrics_session()
