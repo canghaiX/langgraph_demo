@@ -8,6 +8,7 @@ import time
 from langchain_core.messages import HumanMessage
 from langchain_core.messages.tool import ToolMessage
 
+from .config import settings
 from .graph import (
     clear_metrics_session,
     clear_trace_session,
@@ -19,6 +20,7 @@ from .graph import (
     start_trace_session,
 )
 from .lightrag_client import lightrag_service
+from .memory import memory_manager, message_content_to_text
 
 
 # 这里定义“CLI 允许挑出来做入库”的文件类型。
@@ -137,6 +139,14 @@ def _print_metrics(metrics: dict) -> None:
             print(f"  - {name}: {elapsed:.3f}")
 
 
+def _build_agent_messages(user_id: str, history: list) -> list:
+    """把偏好记忆和会话摘要注入当前请求。"""
+    context_message = memory_manager.build_runtime_context_message(user_id)
+    if context_message is None:
+        return list(history)
+    return [context_message, *history]
+
+
 async def _run_ingest(path_str: str) -> None:
     """执行知识库导入。"""
     target = Path(path_str)
@@ -155,30 +165,46 @@ async def _run_ingest(path_str: str) -> None:
         print(f"- {item}")
 
 
-async def _run_ask(question: str, trace: bool = False, metrics: bool = False) -> None:
+async def _run_ask(
+    question: str,
+    trace: bool = False,
+    metrics: bool = False,
+    user_id: str = settings.default_user_id,
+) -> None:
     """执行单轮问答。
 
     适合做快速测试，也适合配合 `--trace` 看 agent 的工具选择。
     """
     agent = await get_agent()
+    memory_manager.infer_and_update_preferences(user_id, question)
     if metrics:
         start_metrics_session()
     if trace:
         start_trace_session()
     started_at = time.perf_counter()
-    result = await agent.ainvoke({"messages": [HumanMessage(content=question)]})
+    request_messages = _build_agent_messages(
+        user_id,
+        [HumanMessage(content=question)],
+    )
+    result = await agent.ainvoke({"messages": request_messages})
     if metrics:
         record_request_metric((time.perf_counter() - started_at) * 1000)
     if trace:
         _print_trace(result, get_trace_events())
         clear_trace_session()
-    print(result["messages"][-1].content)
+    reply_text = message_content_to_text(result["messages"][-1].content)
+    print(reply_text)
+    await memory_manager.remember_exchange(user_id, question, reply_text)
     if metrics:
         _print_metrics(get_metrics_snapshot())
         clear_metrics_session()
 
 
-async def _run_chat(trace: bool = False, metrics: bool = False) -> None:
+async def _run_chat(
+    trace: bool = False,
+    metrics: bool = False,
+    user_id: str = settings.default_user_id,
+) -> None:
     """执行多轮对话。"""
     agent = await get_agent()
     history = []
@@ -190,24 +216,73 @@ async def _run_chat(trace: bool = False, metrics: bool = False) -> None:
         if not user_input:
             continue
 
+        memory_manager.infer_and_update_preferences(user_id, user_input)
         history.append(HumanMessage(content=user_input))
         if metrics:
             start_metrics_session()
         if trace:
             start_trace_session()
         started_at = time.perf_counter()
-        result = await agent.ainvoke({"messages": history})
+        request_messages = _build_agent_messages(user_id, history)
+        result = await agent.ainvoke({"messages": request_messages})
         if metrics:
             record_request_metric((time.perf_counter() - started_at) * 1000)
         reply = result["messages"][-1]
         history.append(reply)
+        history = await memory_manager.compact_history(user_id, history)
         if trace:
             _print_trace(result, get_trace_events())
             clear_trace_session()
-        print(f"\nAI> {reply.content}")
+        print(f"\nAI> {message_content_to_text(reply.content)}")
         if metrics:
             _print_metrics(get_metrics_snapshot())
             clear_metrics_session()
+
+
+def _run_show_preferences(user_id: str) -> None:
+    """打印指定用户的偏好记忆。"""
+    preferences = memory_manager.get_preferences(user_id)
+    print(f"User ID: {user_id}")
+    print(f"- language: {preferences.language}")
+    print(f"- response_style: {preferences.response_style}")
+    print(f"- code_preference: {preferences.code_preference}")
+    print(f"- career_focus: {preferences.career_focus}")
+
+
+def _run_set_preferences(
+    user_id: str,
+    language: str | None,
+    response_style: str | None,
+    code_preference: str | None,
+    career_focus: str | None,
+) -> None:
+    """更新用户偏好记忆。"""
+    updated = memory_manager.update_preferences(
+        user_id,
+        language=language,
+        response_style=response_style,
+        code_preference=code_preference,
+        career_focus=career_focus,
+    )
+    print(f"Updated preferences for {user_id}:")
+    print(f"- language: {updated.language}")
+    print(f"- response_style: {updated.response_style}")
+    print(f"- code_preference: {updated.code_preference}")
+    print(f"- career_focus: {updated.career_focus}")
+
+
+def _run_show_summary(user_id: str) -> None:
+    """打印指定用户的会话摘要记忆。"""
+    summary = memory_manager.get_summary(user_id)
+    print(f"User ID: {user_id}")
+    print(f"- summarized_message_count: {summary.summarized_message_count}")
+    print(summary.summary or "(empty)")
+
+
+def _run_clear_summary(user_id: str) -> None:
+    """清空指定用户的会话摘要记忆。"""
+    memory_manager.clear_summary(user_id)
+    print(f"Cleared session summary for {user_id}.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -234,6 +309,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print request latency and tool/specialist metrics",
     )
+    ask_parser.add_argument(
+        "--user-id",
+        default=settings.default_user_id,
+        help="User id used for preference memory and session summary memory",
+    )
 
     chat_parser = subparsers.add_parser("chat", help="Start interactive chat")
     chat_parser.add_argument(
@@ -245,6 +325,67 @@ def build_parser() -> argparse.ArgumentParser:
         "--metrics",
         action="store_true",
         help="Print request latency and tool/specialist metrics for each turn",
+    )
+    chat_parser.add_argument(
+        "--user-id",
+        default=settings.default_user_id,
+        help="User id used for preference memory and session summary memory",
+    )
+
+    show_pref_parser = subparsers.add_parser(
+        "show-pref", help="Show stored user preferences"
+    )
+    show_pref_parser.add_argument(
+        "--user-id",
+        default=settings.default_user_id,
+        help="User id to inspect",
+    )
+
+    set_pref_parser = subparsers.add_parser(
+        "set-pref", help="Update stored user preferences"
+    )
+    set_pref_parser.add_argument(
+        "--user-id",
+        default=settings.default_user_id,
+        help="User id to update",
+    )
+    set_pref_parser.add_argument(
+        "--language",
+        choices=["zh", "en"],
+        help="Preferred response language",
+    )
+    set_pref_parser.add_argument(
+        "--response-style",
+        choices=["concise", "detailed"],
+        help="Preferred response style",
+    )
+    set_pref_parser.add_argument(
+        "--code-preference",
+        choices=["prefer_examples", "explain_only"],
+        help="Preferred coding explanation style",
+    )
+    set_pref_parser.add_argument(
+        "--career-focus",
+        choices=["general", "internship", "research"],
+        help="Preferred career framing",
+    )
+
+    show_summary_parser = subparsers.add_parser(
+        "show-summary", help="Show stored session summary memory"
+    )
+    show_summary_parser.add_argument(
+        "--user-id",
+        default=settings.default_user_id,
+        help="User id to inspect",
+    )
+
+    clear_summary_parser = subparsers.add_parser(
+        "clear-summary", help="Clear stored session summary memory"
+    )
+    clear_summary_parser.add_argument(
+        "--user-id",
+        default=settings.default_user_id,
+        help="User id to clear",
     )
     return parser
 
@@ -263,6 +404,7 @@ def main() -> None:
                     args.question,
                     trace=args.trace,
                     metrics=getattr(args, "metrics", False),
+                    user_id=getattr(args, "user_id", settings.default_user_id),
                 )
             )
         elif args.command == "chat":
@@ -270,8 +412,23 @@ def main() -> None:
                 _run_chat(
                     trace=getattr(args, "trace", False),
                     metrics=getattr(args, "metrics", False),
+                    user_id=getattr(args, "user_id", settings.default_user_id),
                 )
             )
+        elif args.command == "show-pref":
+            _run_show_preferences(args.user_id)
+        elif args.command == "set-pref":
+            _run_set_preferences(
+                args.user_id,
+                language=getattr(args, "language", None),
+                response_style=getattr(args, "response_style", None),
+                code_preference=getattr(args, "code_preference", None),
+                career_focus=getattr(args, "career_focus", None),
+            )
+        elif args.command == "show-summary":
+            _run_show_summary(args.user_id)
+        elif args.command == "clear-summary":
+            _run_clear_summary(args.user_id)
         else:
             parser.print_help()
     finally:

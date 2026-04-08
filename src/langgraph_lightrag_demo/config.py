@@ -63,6 +63,19 @@ class Settings:
     semantic_chunk_overlap_sentences: int = int(
         os.getenv("SEMANTIC_CHUNK_OVERLAP_SENTENCES", "1")
     )
+    preference_store_path: str = os.getenv(
+        "PREFERENCE_STORE_PATH", ".memory/preferences.json"
+    )
+    session_summary_store_path: str = os.getenv(
+        "SESSION_SUMMARY_STORE_PATH", ".memory/session_summaries.json"
+    )
+    default_user_id: str = os.getenv("DEFAULT_USER_ID", "default_user")
+    session_memory_max_messages: int = int(
+        os.getenv("SESSION_MEMORY_MAX_MESSAGES", "10")
+    )
+    session_memory_recent_messages: int = int(
+        os.getenv("SESSION_MEMORY_RECENT_MESSAGES", "6")
+    )
 
     # MCP 的开关和运行范围控制。
     enable_mcp_web_search: bool = (

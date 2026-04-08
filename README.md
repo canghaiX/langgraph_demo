@@ -9,6 +9,7 @@
 - 多 Agent 架构：将系统拆分为 `Router / Knowledge Specialist / Filesystem Specialist / Web Specialist`
 - RAG 检索链路：集成 LightRAG 做知识库召回，并支持 CrossEncoder rerank
 - 语义递归切分：入库前按标题、段落、句子做递归 chunk 切分，尽量保留语义边界
+- 记忆机制：支持用户偏好记忆与会话摘要记忆，提升跨轮对话连续性
 - 非结构化文档处理：支持 `.txt / .md / .pdf` 入库，PDF 优先直抽文本，失败时自动回退 OCR
 - 可观测性：支持 trace 输出，方便查看 Router 分发、专家调用和底层工具调用轨迹
 - MCP 工具集成：通过本地 MCP Server 接入文件系统检索与网页搜索能力
@@ -105,6 +106,13 @@ Router Agent
 - Prompt 中统一要求基于工具证据回答，并尽量标注来源
 - 支持在 CLI 中通过 `--trace` 查看跨层级调用轨迹
 - trace 会记录 Router 分发、专家调用、工具调用与结果预览
+
+### 6. 用户偏好记忆与会话摘要记忆
+
+- 使用独立 JSON store 持久化用户偏好，如语言、回答风格、代码偏好、求职/科研导向
+- 在 `ask / chat` 请求前，把偏好和历史会话摘要注入运行时提示，影响 Router 的最终回答风格
+- 多轮对话过长时，会把旧消息压缩成会话摘要，只保留最近若干条消息，降低上下文膨胀
+- 支持通过 CLI 查看和设置偏好、查看和清空会话摘要
 
 ## 环境要求
 
@@ -216,12 +224,45 @@ python main.py chat
 python main.py chat --trace
 ```
 
+指定用户 ID 以复用偏好和会话摘要记忆：
+
+```bash
+python main.py chat --user-id demo_user
+python main.py ask "以后都用中文详细回答" --user-id demo_user
+```
+
 ### 4. 通过安装后的命令运行
 
 ```bash
 rag-chat ingest
 rag-chat ask "请解释 Router Agent 的职责"
 rag-chat chat --trace
+```
+
+### 5. 管理偏好与会话摘要记忆
+
+查看用户偏好：
+
+```bash
+python main.py show-pref --user-id demo_user
+```
+
+更新用户偏好：
+
+```bash
+python main.py set-pref --user-id demo_user --language zh --response-style detailed --code-preference prefer_examples --career-focus internship
+```
+
+查看会话摘要：
+
+```bash
+python main.py show-summary --user-id demo_user
+```
+
+清空会话摘要：
+
+```bash
+python main.py clear-summary --user-id demo_user
 ```
 
 ## 支持的文件类型

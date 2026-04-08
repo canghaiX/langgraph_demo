@@ -31,8 +31,17 @@ def test_collect_files_filters_supported_suffixes(tmp_path: Path) -> None:
 def test_build_parser_supports_metrics_flags() -> None:
     parser = build_parser()
 
-    ask_args = parser.parse_args(["ask", "hello", "--metrics"])
-    chat_args = parser.parse_args(["chat", "--metrics"])
+    ask_args = parser.parse_args(["ask", "hello", "--metrics", "--user-id", "alice"])
+    chat_args = parser.parse_args(["chat", "--metrics", "--user-id", "alice"])
+    set_pref_args = parser.parse_args(
+        ["set-pref", "--user-id", "alice", "--language", "zh", "--response-style", "detailed"]
+    )
+    show_summary_args = parser.parse_args(["show-summary", "--user-id", "alice"])
 
     assert ask_args.metrics is True
     assert chat_args.metrics is True
+    assert ask_args.user_id == "alice"
+    assert chat_args.user_id == "alice"
+    assert set_pref_args.language == "zh"
+    assert set_pref_args.response_style == "detailed"
+    assert show_summary_args.user_id == "alice"
